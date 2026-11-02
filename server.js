@@ -6,7 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { StringDecoder } = require('string_decoder');
-const { timingSafeEqual } = require('crypto');
+const { timingSafeEqual, createHmac, randomBytes } = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,11 +16,19 @@ const PORT = process.env.PORT || 3000;
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 const CLIENT_AUTH_KEY = process.env.CLIENT_AUTH_KEY;
+const RP_ENGINE_URL = process.env.RP_ENGINE_URL;
+const RP_ENGINE_SECRET = process.env.RP_ENGINE_SECRET;
 
 const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
 const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+
+// Temporary, privacy-conscious request diagnostics. Enable with DIAGNOSTICS=true.
+// The diagnostic HMAC key is random per server start, so message fingerprints cannot
+// be used to recover message text and only compare consistently during this run.
+const DIAGNOSTICS = process.env.DIAGNOSTICS === 'true';
+const DIAGNOSTIC_HASH_KEY = DIAGNOSTICS ? randomBytes(32) : null;
 
 const MAX_TOKENS_LIMIT = 65536;
 const REQUEST_TIMEOUT_MS = 180000;
@@ -34,9 +42,9 @@ if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 
 function validateConfig() {
   const fatal = (msg) => { console.error(`[FATAL] ${msg}`); process.exit(1); };
-  
+
   if (!NIM_API_KEY) fatal('NIM_API_KEY is required. Get one at https://build.nvidia.com/');
-  
+
   if (!CLIENT_AUTH_KEY) {
     console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.');
   }
@@ -86,6 +94,157 @@ const FALLBACK_MODELS = [
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ─── Safe request diagnostics (temporary) ───────────────────────────────────
+// Never log actual chat text, API keys, authorization headers, cookies, or raw IDs.
+// We log only field names/types and keyed fingerprints for candidate identifiers and
+// message contents, so repeated values can be compared during a single server run.
+function diagnosticFingerprint(value) {
+  let serialized;
+  try {
+    serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    serialized = String(value);
+  }
+  return createHmac('sha256', DIAGNOSTIC_HASH_KEY)
+    .update(serialized ?? 'undefined')
+    .digest('hex')
+    .slice(0, 10);
+}
+
+function diagnosticType(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return `array(length=${value.length})`;
+  if (typeof value === 'string') return `string(length=${value.length})`;
+  if (typeof value === 'object') return 'object';
+  return typeof value;
+}
+
+function looksLikeIdentifier(name) {
+  return /(chat|conversation|thread|session|dialog|turn|message|uuid|request.?id|(?:^|[-_])id$)/i.test(name);
+}
+
+function collectDiagnosticFields(value, path = 'body', depth = 0, out = []) {
+  if (out.length >= 160 || depth > 7 || value === null || typeof value !== 'object') return out;
+
+  const entries = Array.isArray(value)
+    ? value.slice(0, 120).map((item, index) => [String(index), item])
+    : Object.entries(value);
+
+  for (const [key, child] of entries) {
+    if (out.length >= 160) break;
+    const fieldPath = Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`;
+    const lowerKey = String(key).toLowerCase();
+
+    // Messages are summarized separately with role and keyed content fingerprints.
+    if (lowerKey === 'messages') {
+      out.push(`${fieldPath}: ${diagnosticType(child)} [summarized separately]`);
+      continue;
+    }
+
+    // Content-like fields are listed by type only. Their text is never logged.
+    if (['content', 'text', 'prompt', 'system_prompt', 'instructions', 'description', 'persona', 'authorization', 'cookie', 'api_key', 'apikey', 'token', 'secret'].includes(lowerKey)) {
+      out.push(`${fieldPath}: ${diagnosticType(child)} [value omitted]`);
+      continue;
+    }
+
+    if (looksLikeIdentifier(String(key))) {
+      const fingerprint = (typeof child === 'string' || typeof child === 'number')
+        ? ` fingerprint=${diagnosticFingerprint(child)}`
+        : '';
+      out.push(`${fieldPath}: ${diagnosticType(child)}${fingerprint}`);
+    } else {
+      out.push(`${fieldPath}: ${diagnosticType(child)}`);
+    }
+
+    if (child && typeof child === 'object') {
+      collectDiagnosticFields(child, fieldPath, depth + 1, out);
+    }
+  }
+  return out;
+}
+
+function collectCandidateIdentifiers(value, path = 'message', depth = 0, out = []) {
+  if (out.length >= 40 || depth > 5 || value === null || typeof value !== 'object') return out;
+  const entries = Array.isArray(value)
+    ? value.slice(0, 30).map((item, index) => [String(index), item])
+    : Object.entries(value);
+  for (const [key, child] of entries) {
+    if (out.length >= 40) break;
+    const lowerKey = String(key).toLowerCase();
+    if (['content', 'text', 'prompt', 'system_prompt', 'instructions', 'description', 'persona', 'authorization', 'cookie', 'api_key', 'apikey', 'token', 'secret'].includes(lowerKey)) continue;
+    const fieldPath = Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`;
+    if (looksLikeIdentifier(String(key))) {
+      out.push({
+        path: fieldPath,
+        type: diagnosticType(child),
+        fingerprint: (typeof child === 'string' || typeof child === 'number')
+          ? diagnosticFingerprint(child)
+          : undefined
+      });
+    }
+    if (child && typeof child === 'object') collectCandidateIdentifiers(child, fieldPath, depth + 1, out);
+  }
+  return out;
+}
+
+function logRequestDiagnostics(req) {
+  if (!DIAGNOSTICS) return;
+
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const headerIdentifiers = Object.entries(req.headers || {})
+    .filter(([name]) => looksLikeIdentifier(name))
+    .map(([name, value]) => ({
+      name,
+      type: diagnosticType(value),
+      fingerprint: (typeof value === 'string' || typeof value === 'number')
+        ? diagnosticFingerprint(value)
+        : undefined
+    }));
+  const queryIdentifiers = Object.entries(req.query || {})
+    .filter(([name]) => looksLikeIdentifier(name))
+    .map(([name, value]) => ({
+      name,
+      type: diagnosticType(value),
+      fingerprint: (typeof value === 'string' || typeof value === 'number')
+        ? diagnosticFingerprint(value)
+        : undefined
+    }));
+
+  const messageSummaries = messages.map((message, index) => {
+    const role = typeof message?.role === 'string' ? message.role : 'unknown';
+    const contentExists = message && Object.prototype.hasOwnProperty.call(message, 'content');
+    return {
+      index,
+      role,
+      keys: message && typeof message === 'object' ? Object.keys(message).sort() : [],
+      contentType: contentExists ? diagnosticType(message.content) : 'missing',
+      // Fingerprint only: the actual content is never written to logs.
+      contentFingerprint: contentExists ? diagnosticFingerprint(message.content) : null,
+      candidateIdentifiers: collectCandidateIdentifiers(message, `messages[${index}]`)
+    };
+  });
+
+  const report = {
+    marker: 'JANITOR_REQUEST_DIAGNOSTICS',
+    time: new Date().toISOString(),
+    method: req.method,
+    path: req.path,
+    bodyTopLevelKeys: Object.keys(body).sort(),
+    queryKeys: Object.keys(req.query || {}).sort(),
+    headerNames: Object.keys(req.headers || {}).sort(),
+    messageCount: messages.length,
+    messageRoles: messages.map(message => typeof message?.role === 'string' ? message.role : 'unknown'),
+    // Compare the same index across requests to see if messages were edited/removed.
+    messageSummaries,
+    candidateIdentifierHeaders: headerIdentifiers,
+    candidateIdentifierQueryFields: queryIdentifiers,
+    bodyFieldPaths: collectDiagnosticFields(body)
+  };
+
+  console.log(`[DIAGNOSTICS] ${JSON.stringify(report)}`);
+}
+
 // FIX: Extract token AFTER "Bearer " prefix, compare only the token
 // Prevents bypass when CLIENT_AUTH_KEY is empty (expected would be "Bearer " which is 7 chars)
 function extractBearerToken(authHeader) {
@@ -103,14 +262,13 @@ function safeTimingEqual(a, b) {
     return false;
   }
 }
-
 app.use((req, res, next) => {
   if (req.path === '/health' || req.path === '/v1/models') {
     return next();
   }
 
   const token = extractBearerToken(req.headers.authorization);
-  
+
   if (!token || !CLIENT_AUTH_KEY) {
     return res.status(403).json({
       error: {
@@ -160,7 +318,7 @@ async function validateModels() {
     );
 
     const invalid = [];
-    
+
     for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
       if (availableModels.has(nimId)) {
         console.log(`[VALIDATION] ✓ ${alias} → ${nimId}`);
@@ -205,6 +363,41 @@ async function sendDiscordAlert(invalidModels) {
     console.log('[DISCORD] Alert sent.');
   } catch (err) {
     console.error('[DISCORD] Failed to send alert:', err.message);
+  }
+}
+
+// ─── RP Engine: Memory connection test ─────────────────────────────────────
+
+async function testMemoryConnection() {
+  if (!RP_ENGINE_URL || !RP_ENGINE_SECRET) {
+    console.warn('[MEMORY] RP_ENGINE_URL or RP_ENGINE_SECRET is missing.');
+    return;
+  }
+
+  try {
+    const baseUrl = RP_ENGINE_URL.replace(/\/+$/, '');
+
+    const response = await axios.get(`${baseUrl}/test`, {
+      headers: {
+        Authorization: `Bearer ${RP_ENGINE_SECRET}`
+      },
+      timeout: 10000
+    });
+
+    if (response.data?.success) {
+      console.log(
+        '[MEMORY] Worker connection successful. Records:',
+        response.data.data?.length ?? 0
+      );
+    } else {
+      console.warn('[MEMORY] Worker returned an unexpected response.');
+    }
+
+  } catch (error) {
+    console.error(
+      '[MEMORY] Connection failed:',
+      error.response?.status || error.code || error.message
+    );
   }
 }
 
@@ -277,6 +470,8 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  logRequestDiagnostics(req);
+
   let streamEndedCleanly = false;
   let upstreamStream = null;
 
@@ -427,7 +622,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       upstreamStream.on('error', err => {
         console.error('[STREAM] Upstream error:', err.message);
-        
+
         if (!res.writableEnded) {
           safeWrite(res, `data: ${JSON.stringify({
             error: {
@@ -445,7 +640,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       // Don't destroy already-finished streams
       req.on('close', () => {
         const clientGone = req.destroyed || !res.writable;
-        
+
         if (!streamEndedCleanly && clientGone) {
           console.warn('[STREAM] Client disconnected prematurely');
         }
@@ -537,10 +732,12 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
   console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
-  
+
   // Run validation after server starts, non-blocking
   validateModels().catch(err => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
+
+  // Test RP Engine memory connection
+  testMemoryConnection();
 });
-  
